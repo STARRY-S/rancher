@@ -3,6 +3,7 @@ package eks
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"net"
@@ -28,6 +29,7 @@ import (
 	typesDialer "github.com/rancher/rancher/pkg/types/config/dialer"
 	"github.com/rancher/rancher/pkg/wrangler"
 	"github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v2"
 	"k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -77,6 +79,7 @@ func Register(ctx context.Context, wContext *wrangler.Context, mgmtCtx *config.M
 		Discovery:            wContext.K8s.Discovery(),
 	}}
 
+	fmt.Printf("XXXXXXXXXX Register\n")
 	wContext.Mgmt.Cluster().OnChange(ctx, "eks-operator-controller", e.onClusterChange)
 }
 
@@ -87,6 +90,16 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 
 	if cluster.Spec.EKSConfig == nil {
 		return cluster, nil
+	}
+
+	fmt.Printf("XXXXXXXXXX onClusterChange\n")
+	xCluster := cluster.DeepCopy()
+	xCluster.ManagedFields = nil
+	xBytes, errX := yaml.Marshal(xCluster)
+	if errX != nil {
+		fmt.Printf("Failed to unmarshall: %v\n%s", errX, string(xBytes))
+	} else {
+		fmt.Printf("XXXXXX xCluster: \n%s\n", string(xBytes))
 	}
 
 	cluster, err := e.CheckCrdReady(cluster, "eks")
@@ -112,6 +125,7 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 			return cluster, err
 		}
 
+		fmt.Printf("XXXXXXXXXX Create cluster config\n")
 		cluster, err = e.SetUnknown(cluster, apimgmtv3.ClusterConditionWaiting, "Waiting for API to be available")
 		if err != nil {
 			return cluster, err
@@ -121,12 +135,21 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 		if err != nil {
 			return cluster, err
 		}
+		// fmt.Printf("XXXXXXXX buildEKSCCCreateObject return %+v\n", *eksClusterConfigDynamic)
 
 		eksClusterConfigDynamic, err = e.DynamicClient.Namespace(namespace.GlobalNamespace).Create(context.TODO(), eksClusterConfigDynamic, v1.CreateOptions{})
+		fmt.Printf("XXXXXXXX Create return %+v\n", *eksClusterConfigDynamic)
 		if err != nil {
 			return cluster, err
 		}
 
+	}
+
+	xBytes, errX = json.MarshalIndent(eksClusterConfigDynamic.Object, "", "    ")
+	if errX != nil {
+		fmt.Printf("Failed to unmarshall: %v\n%s", errX, string(xBytes))
+	} else {
+		fmt.Printf("XXXXXX Create eksClusterConfigDynamic.Object: \n%s\n", string(xBytes))
 	}
 
 	eksClusterConfigMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&cluster.Spec.EKSConfig)
@@ -144,11 +167,14 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 	status, _ := eksClusterConfigDynamic.Object["status"].(map[string]interface{})
 	phase, _ := status["phase"]
 	failureMessage, _ := status["failureMessage"].(string)
+	// fmt.Printf("XXXXXXXX status %+v\n", status)
+	fmt.Printf("XXXXXX phase %s\n", phase)
 	if strings.Contains(failureMessage, "403") {
 		failureMessage = fmt.Sprintf("cannot access EKS, check cloud credential: %s", failureMessage)
 	}
 	switch phase {
 	case "creating":
+		fmt.Printf("XXXXXXXX Creating\n")
 		if cluster.Status.EKSStatus.UpstreamSpec == nil {
 			cluster, err = e.setInitialUpstreamSpec(cluster)
 			if err != nil {
@@ -167,6 +193,7 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 		logrus.Infof("waiting for cluster EKS [%s] create failure to be resolved", cluster.Name)
 		return e.SetFalse(cluster, apimgmtv3.ClusterConditionProvisioned, failureMessage)
 	case "active":
+		fmt.Printf("XXXXXXXX active\n")
 		if cluster.Spec.EKSConfig.Imported {
 			if cluster.Status.EKSStatus.UpstreamSpec == nil {
 				// non imported clusters will have already had upstream spec set
@@ -194,6 +221,7 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 		noNodeGroupsOnSpec := len(cluster.Spec.EKSConfig.NodeGroups) == 0
 		noNodeGroupsOnUpstreamSpec := len(cluster.Status.EKSStatus.UpstreamSpec.NodeGroups) == 0
 		if (cluster.Spec.EKSConfig.NodeGroups != nil && noNodeGroupsOnSpec) || (cluster.Spec.EKSConfig.NodeGroups == nil && noNodeGroupsOnUpstreamSpec) {
+			fmt.Printf("XXXXXXXX noNodeGroupsOnSpec: %v, noNodeGroupsOnUpstreamSpec: %v\n", noNodeGroupsOnSpec, noNodeGroupsOnUpstreamSpec)
 			cluster, err = e.SetFalse(cluster, apimgmtv3.ClusterConditionWaiting, addNgMessage)
 			if err != nil {
 				return cluster, err
@@ -201,6 +229,7 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 		} else {
 			if apimgmtv3.ClusterConditionWaiting.GetMessage(cluster) == addNgMessage {
 				cluster = cluster.DeepCopy()
+				fmt.Printf("XXXXXXXX Set Waiting for API to be available\n")
 				apimgmtv3.ClusterConditionWaiting.Message(cluster, "Waiting for API to be available")
 				cluster, err = e.ClusterClient.Update(cluster)
 				if err != nil {
@@ -217,6 +246,7 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 		// If there are no subnets it can be assumed that networking fields are not provided. In which case they
 		// should be created by the eks-operator, and needs to be copied to the cluster object.
 		if len(cluster.Status.EKSStatus.Subnets) == 0 {
+			fmt.Printf("XXXXXXXX len(cluster.Status.EKSStatus.Subnets) == 0\n")
 			subnets, _ := status["subnets"].([]interface{})
 			if len(subnets) != 0 {
 				// network field have been generated and are ready to be copied
@@ -233,6 +263,8 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 				for _, val := range securityGroups {
 					cluster.Status.EKSStatus.SecurityGroups = append(cluster.Status.EKSStatus.SecurityGroups, val.(string))
 				}
+				fmt.Printf("XXXXXXXX Subnets: %+v\n", cluster.Status.EKSStatus.Subnets)
+				fmt.Printf("XXXXXXXX SecurityGroups: %+v\n", cluster.Status.EKSStatus.SecurityGroups)
 				cluster, err = e.ClusterClient.Update(cluster)
 				if err != nil {
 					return cluster, err
@@ -289,6 +321,7 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 		}
 
 		clusterLaunchTemplateID, _ := status["managedLaunchTemplateID"].(string)
+		fmt.Printf("XXXXXXXX clusterLaunchTemplateID %v\n", clusterLaunchTemplateID)
 		if clusterLaunchTemplateID != "" && cluster.Status.EKSStatus.ManagedLaunchTemplateID != clusterLaunchTemplateID {
 			cluster = cluster.DeepCopy()
 			cluster.Status.EKSStatus.ManagedLaunchTemplateID = clusterLaunchTemplateID
@@ -299,6 +332,7 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 		}
 
 		managedLaunchTemplateVersions, _ := status["managedLaunchTemplateVersions"].(map[string]interface{})
+		fmt.Printf("XXXXXXXX managedLaunchTemplateVersions %v\n", managedLaunchTemplateVersions)
 		if !reflect.DeepEqual(cluster.Status.EKSStatus.ManagedLaunchTemplateVersions, managedLaunchTemplateVersions) {
 			managedLaunchTemplateVersionsToString := make(map[string]string, len(managedLaunchTemplateVersions))
 			for key, value := range managedLaunchTemplateVersions {
@@ -319,6 +353,7 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 
 		return e.SetTrue(cluster, apimgmtv3.ClusterConditionUpdated, "")
 	case "updating":
+		fmt.Printf("XXXXXXXX Updating\n")
 		cluster, err = e.SetTrue(cluster, apimgmtv3.ClusterConditionProvisioned, "")
 		if err != nil {
 			return cluster, err
@@ -332,6 +367,7 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 		logrus.Infof("waiting for cluster EKS [%s] update failure to be resolved", cluster.Name)
 		return e.SetFalse(cluster, apimgmtv3.ClusterConditionUpdated, failureMessage)
 	default:
+		fmt.Printf("XXXXXXXX default\n")
 		if cluster.Spec.EKSConfig.Imported {
 			cluster, err = e.SetUnknown(cluster, apimgmtv3.ClusterConditionPending, "")
 			if err != nil {
